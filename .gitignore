@@ -1,3 +1,4 @@
 result
 tmp
 examples/**/flake.lock
+image.tar
