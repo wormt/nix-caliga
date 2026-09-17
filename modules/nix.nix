@@ -4,6 +4,7 @@
   lib,
   pkgs,
   nixpkgs,
+  utils,
   ...
 }:
 
@@ -18,6 +19,10 @@ let
       lib.concatMapStringsSep " " toString v
     else
       toString v;
+
+  lowerStoreUrl = "/run/nix-lower?read-only=true";
+  localOverlayStoreUrl = "local-overlay://?upper-layer=/var/nix/store/upper&state=/var/nix/overlay-state&lower-store=${lib.strings.escapeURL lowerStoreUrl}";
+  execStartStoreUrl = lib.replaceStrings [ "%" ] [ "%%" ] localOverlayStoreUrl;
 in
 {
   options.nix = {
@@ -38,14 +43,19 @@ in
         experimental-features = [
           "nix-command"
           "flakes"
+          "local-overlay-store"
+          "read-only-local-store"
         ];
-        # considering adding this with a systemd service so nixpkgs source doesnt get built into the image, thinking it might heavily contribute to ostree xattrs hard link limits?
         nix-path = "nixpkgs=${nixpkgs}";
+        store = "daemon";
       };
       description = ''
         Settings written to /etc/nix/nix.conf. Defaults to enabling
-        nix-command, flakes, and pointing nix-path at the nixpkgs
-        source baked into the image from the flake input.
+        nix-command, flakes, local-overlay-store, and
+        read-only-local-store, pointing nix-path at the nixpkgs source
+        baked into the image from the flake input, and configuring the
+        store as a local-overlay-store layered over the image-baked
+        /nix
       '';
     };
   };
@@ -80,35 +90,88 @@ in
     systemd.tmpfiles.packages = [ cfg.package ];
 
     systemd.sockets.nix-daemon.wantedBy = [ "sockets.target" ];
+    systemd.services.nix-daemon.serviceConfig.ExecStart = [
+      ""
+      "@${cfg.package}/bin/nix-daemon nix-daemon --daemon --option store ${execStartStoreUrl}"
+    ];
 
-    # writable /nix over read-only image /nix.
-    # Skipped in containers where /nix is already writable.
+    systemd.services.nix-lower-mount = {
+      wantedBy = [ "local-fs.target" ];
+      before = [ "local-fs.target" ];
+      unitConfig.DefaultDependencies = false;
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        #sometimes is needed to keep the nix store working after a bootc update
+        sleep 30
+
+        mkdir -p /run/nix-lower/nix
+        ${pkgs.util-linux}/bin/mount --bind /nix /run/nix-lower/nix
+        ${pkgs.util-linux}/bin/mount -o remount,bind,ro /run/nix-lower/nix
+      '';
+    };
+
     systemd.mounts = [
       {
-        where = "/nix";
+        where = "/nix/store";
         what = "overlay";
         type = "overlay";
-        options = "lowerdir=/nix,upperdir=/var/nix/upper,workdir=/var/nix/work";
+        options = "lowerdir=/run/nix-lower/nix/store,upperdir=/var/nix/store/upper,workdir=/var/nix/store/work";
+        wantedBy = [ "local-fs.target" ];
+        before = [ "local-fs.target" ];
+        after = [ "nix-lower-mount.service" ];
+        requires = [ "nix-lower-mount.service" ];
+        unitConfig = {
+          DefaultDependencies = false;
+          RequiresMountsFor = "/var";
+          ConditionPathIsReadWrite = "!/nix/store";
+        };
+      }
+      {
+        where = "/nix/var/nix";
+        what = "tmpfs";
+        type = "tmpfs";
+        options = "mode=0755";
         wantedBy = [ "local-fs.target" ];
         before = [ "local-fs.target" ];
         unitConfig = {
           DefaultDependencies = false;
+          ConditionPathIsReadWrite = "!/nix/var/nix";
+        };
+      }
+      {
+        where = "/var/nix/overlay-state/gcroots/docker";
+        what = "/run/nix-lower/nix/var/nix/gcroots/docker";
+        options = "bind,ro";
+        wantedBy = [ "local-fs.target" ];
+        before = [
+          "local-fs.target"
+          "nix-daemon.socket"
+        ];
+        after = [ "nix-lower-mount.service" ];
+        requires = [ "nix-lower-mount.service" ];
+        unitConfig = {
+          DefaultDependencies = false;
           RequiresMountsFor = "/var";
-          ConditionPathIsReadWrite = "!/nix";
         };
       }
     ];
 
     systemd.tmpfiles.rules = [
-      "d /var/nix 0755 root root -"
-      "d /var/nix/upper 0755 root root -"
-      "d /var/nix/work 0755 root root -"
+      "d /var/nix/store/upper 0755 root root -"
+      "d /var/nix/store/work 0755 root root -"
+      "d /var/nix/overlay-state/gcroots 0755 root root -"
+      "d /var/nix/overlay-state/db 0755 root root -"
+      "d /var/nix/overlay-state/profiles 0755 root root -"
+      "d /var/nix/overlay-state/temproots 0755 root root -"
+      "d /var/nix/overlay-state/userpool 0755 root root -"
     ];
 
     systemd.services.nix-directory-setup = {
-      description = "Create Nix daemon directories";
       after = [
-        "nix.mount"
+        "${utils.escapeSystemdPath "/nix/var/nix"}.mount"
         "local-fs.target"
       ];
       before = [ "nix-daemon.socket" ];
@@ -119,7 +182,7 @@ in
         RemainAfterExit = true;
       };
       script = ''
-        mkdir -p /nix/var/nix/{db,daemon-socket,gcroots,profiles,temproots,userpool}
+        mkdir -p /nix/var/nix/daemon-socket
       '';
     };
 
@@ -138,6 +201,7 @@ in
     );
 
     environment.etc."nix/nix.conf".text =
-      lib.concatStringsSep "\n" (lib.mapAttrsToList (k: v: "${k} = ${formatValue v}") cfg.settings) + "\n";
+      lib.concatStringsSep "\n" (lib.mapAttrsToList (k: v: "${k} = ${formatValue v}") cfg.settings)
+      + "\n";
   };
 }
