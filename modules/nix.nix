@@ -23,6 +23,12 @@ let
   lowerStoreUrl = "/run/nix-lower?read-only=true";
   localOverlayStoreUrl = "local-overlay://?upper-layer=/var/nix/store/upper&state=/var/nix/overlay-state&lower-store=${lib.strings.escapeURL lowerStoreUrl}";
   execStartStoreUrl = lib.replaceStrings [ "%" ] [ "%%" ] localOverlayStoreUrl;
+
+  nixEnv = {
+    NIX_DAEMON_SOCKET_PATH = "/nix/var/nix/daemon-socket/socket";
+    NIX_LOG_DIR = "/var/nix/var/log/nix";
+    NIX_STATE_DIR = "/var/nix/overlay-state";
+  };
 in
 {
   options.nix = {
@@ -89,31 +95,38 @@ in
     systemd.packages = [ cfg.package ];
     systemd.tmpfiles.packages = [ cfg.package ];
 
-    systemd.sockets.nix-daemon.wantedBy = [ "sockets.target" ];
-    systemd.services.nix-daemon.serviceConfig.ExecStart = [
-      ""
-      "@${cfg.package}/bin/nix-daemon nix-daemon --daemon --option store ${execStartStoreUrl}"
-    ];
-
-    systemd.services.nix-lower-mount = {
-      wantedBy = [ "local-fs.target" ];
-      before = [ "local-fs.target" ];
-      unitConfig.DefaultDependencies = false;
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-      };
-      script = ''
-        #sometimes is needed to keep the nix store working after a bootc update
-        sleep 30
-
-        mkdir -p /run/nix-lower/nix
-        ${pkgs.util-linux}/bin/mount --bind /nix /run/nix-lower/nix
-        ${pkgs.util-linux}/bin/mount -o remount,bind,ro /run/nix-lower/nix
-      '';
+    systemd.sockets.nix-daemon = {
+      wantedBy = [ "sockets.target" ];
+      requires = [ "nix-directory-setup.service" ];
+      after = ["nix-directory-setup.service"];
     };
 
+    systemd.services.nix-daemon = {
+      serviceConfig.ExecStart = [
+        ""
+        "@${cfg.package}/bin/nix-daemon nix-daemon --daemon --option store ${execStartStoreUrl}"
+      ];
+      requires = [ "nix-directory-setup.service" ];
+      after = ["nix-directory-setup.service"];
+    };
+
+    environment.variables = nixEnv;
+    systemd.globalEnvironment = nixEnv;
+
     systemd.mounts = [
+      {
+        where = "/run/nix-lower/nix";
+        what = "/nix";
+        options = "bind,ro";
+        wantedBy = [ "local-fs.target" ];
+        before = [ "local-fs.target" ];
+        after = [ "ostree-remount.service" ];
+        wants = [ "ostree-remount.service" ];
+        unitConfig = {
+          DefaultDependencies = false;
+          RequiresMountsFor = "/nix";
+        };
+      }
       {
         where = "/nix/store";
         what = "overlay";
@@ -121,8 +134,8 @@ in
         options = "lowerdir=/run/nix-lower/nix/store,upperdir=/var/nix/store/upper,workdir=/var/nix/store/work";
         wantedBy = [ "local-fs.target" ];
         before = [ "local-fs.target" ];
-        after = [ "nix-lower-mount.service" ];
-        requires = [ "nix-lower-mount.service" ];
+        after = [ "${utils.escapeSystemdPath "/run/nix-lower/nix"}.mount" ];
+        requires = [ "${utils.escapeSystemdPath "/run/nix-lower/nix"}.mount" ];
         unitConfig = {
           DefaultDependencies = false;
           RequiresMountsFor = "/var";
@@ -150,8 +163,8 @@ in
           "local-fs.target"
           "nix-daemon.socket"
         ];
-        after = [ "nix-lower-mount.service" ];
-        requires = [ "nix-lower-mount.service" ];
+        after = [ "${utils.escapeSystemdPath "/run/nix-lower/nix"}.mount" ];
+        requires = [ "${utils.escapeSystemdPath "/run/nix-lower/nix"}.mount" ];
         unitConfig = {
           DefaultDependencies = false;
           RequiresMountsFor = "/var";
@@ -174,15 +187,22 @@ in
         "${utils.escapeSystemdPath "/nix/var/nix"}.mount"
         "local-fs.target"
       ];
-      before = [ "nix-daemon.socket" ];
+      before = [
+        "nix-store.mount"
+	    "nix-daemon.socket"
+	    "nix-daemon.service"
+	  ];
       wantedBy = [ "sockets.target" ];
-      unitConfig.DefaultDependencies = false;
+      unitConfig = {
+          DefaultDependencies = false;
+          RequiresMountsFor = "/var";
+      };
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
       };
       script = ''
-        mkdir -p /nix/var/nix/daemon-socket
+        install -dm 0755 /nix/var/nix/daemon-socket
       '';
     };
 
