@@ -45,8 +45,7 @@
         }
       ) imageConfigs;
 
-      packages.x86_64-linux = tests.packages;
-      apps.x86_64-linux = tests.apps;
+      legacyPackages.x86_64-linux = tests.legacyPackages;
 
       devShells.x86_64-linux.default = pkgs.mkShell {
         packages = [

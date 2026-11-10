@@ -5,7 +5,7 @@
     {
       name,
       image,
-      testFile,
+      bats,
     }:
     pkgs.writeShellApplication {
       name = "caliga-test-${name}";
@@ -30,7 +30,7 @@
         }
 
         testdir="$(mktemp -d /tmp/caliga-test-${name}.XXXXXXXXXX)"
-        cp -r ${../bats}/. "$testdir/"
+        cp ${bats} "$testdir/test.bats"
 
         # shellcheck disable=SC2329
         cleanup() {
@@ -44,11 +44,11 @@
         echo "Streaming image into podman"
         ${image} | podman load -q
 
-        echo "Booting $VM & executing ${testFile}"
+        echo "Booting $VM & executing ${name}"
 
         bcvk ephemeral run --detach --name "$VM" \
           --ro-bind "$testdir:tests" \
-          --execute "sh -c 'bats /run/virtiofs-mnt-tests/${testFile}; rc=\$?; echo CALIGA_TEST_EXIT:\$rc; poweroff -f'" \
+          --execute "sh -c 'bats /run/virtiofs-mnt-tests/test.bats; rc=\$?; echo CALIGA_TEST_EXIT:\$rc; poweroff -f'" \
           "$IMAGE"
 
         podman wait "$VM" >/dev/null 2>&1 || true
